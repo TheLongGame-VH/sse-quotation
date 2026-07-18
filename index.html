@@ -192,6 +192,7 @@ body.pdf-export-mode .table-wrapper{margin:0 14px!important;overflow:visible!imp
 <select id="brand"></select>
 <label>Item</label>
 <select id="item"></select>
+<div id="stockBadge" style="font-size:11.5px;font-weight:600;margin:-2px 0 8px 1px"></div>
 <div class="entry-grid-mobile">
   <div>
     <label>Unit</label>
@@ -371,8 +372,16 @@ body.pdf-export-mode .table-wrapper{margin:0 14px!important;overflow:visible!imp
   <button class="btn-pdf" onclick="exportPDF()">📄 PDF</button>
   <button class="btn-prices" onclick="refreshPrices(true)">🔄 REFRESH PRICES</button>
   <button class="btn-edit-prices" onclick="openPriceEditor()">✏️ EDIT PRICES</button>
+  <button class="btn-prices" onclick="addAllItemsToInventory(this)" style="background:#185FA5;color:#fff">🏭 ADD ITEMS TO INVENTORY</button>
   <span id="priceStatus" class="no-print" style="font-size:11px;color:var(--muted);align-self:center;margin-left:4px"></span>
+  <span id="invStatus" class="no-print" style="font-size:11px;color:var(--muted);align-self:center;margin-left:4px"></span>
   <span id="saveStatus" class="no-print" style="font-size:11px;color:#1b7a4a;align-self:center;margin-left:4px;font-weight:700"></span>
+</div>
+
+<div id="indentBanner" class="no-print" style="display:none;margin:0 14px 14px;padding:10px 14px;background:#fff3e0;border:1px solid #f0b429;border-radius:8px;align-items:center;gap:12px;flex-wrap:wrap">
+  <span id="indentBannerText" style="font-size:12.5px;font-weight:600;color:#8a5a00;flex:1"></span>
+  <button onclick="generateIndentPDF()" style="background:#e65100;color:#fff;border:none;border-radius:6px;padding:7px 12px;font-weight:700;cursor:pointer;font-size:12px">📋 Print / Save Indent as PDF</button>
+  <button onclick="dismissIndentBanner()" style="background:none;border:1px solid #c9a227;color:#8a5a00;border-radius:6px;padding:7px 10px;cursor:pointer;font-size:12px">Dismiss</button>
 </div>
 
 <!-- EDIT PRICES MODAL -->
@@ -789,6 +798,300 @@ const SUPABASE_URL = "https://psfqruuzjwpvllahlkla.supabase.co";
 const SUPABASE_KEY = "sb_publishable_9jcUcWEowbzGG3QgEA943g_VS0BJQWl";
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
+/* ===== INVENTORY LINK (SGE-SSE Inventory System — read-only) =====
+   Second, independent Supabase project that holds live stock levels.
+   Used only to CHECK availability while building a quotation — never
+   written to from here, so it can never affect stock records. */
+const INV_SUPABASE_URL = "https://ibawonlchzxmocoxkirz.supabase.co";
+const INV_SUPABASE_KEY = "sb_publishable_j3BvHCejXy9hOnlB0EpcSw_6nJM5N-l";
+const invSb = window.supabase.createClient(INV_SUPABASE_URL, INV_SUPABASE_KEY);
+
+let inventoryMap = {};       // normKey(brand,name) -> {stock, unit, byLoc:{GODOWN:x,OFFICE:y}}
+let inventoryLoaded = false;
+let lastShortfalls = [];     // populated after each save, used by the indent PDF button
+let lastIndentMeta = {};
+
+function normKey(brand,name){
+  return String(brand||"").trim().toUpperCase()+"|"+String(name||"").trim().toUpperCase();
+}
+
+async function loadInventoryStock(){
+  const badge=document.getElementById("invStatus");
+  try{
+    if(badge) badge.textContent="Checking stock…";
+    const { data, error } = await invSb.from("item_stock_fast").select("*");
+    if(error) throw error;
+    inventoryMap = {};
+    (data||[]).forEach(i=>{
+      const k=normKey(i.brand,i.name);
+      if(!inventoryMap[k]) inventoryMap[k]={stock:0,unit:i.unit||"",byLoc:{}};
+      const s=Math.max(0, parseFloat(i.stock)||0);
+      inventoryMap[k].stock+=s;
+      const loc=i.location||"GODOWN";
+      inventoryMap[k].byLoc[loc]=(inventoryMap[k].byLoc[loc]||0)+s;
+    });
+    inventoryLoaded=true;
+    if(badge) badge.textContent="✓ Stock data live ("+new Date().toLocaleTimeString()+")";
+  }catch(e){
+    inventoryLoaded=false;
+    console.warn("Inventory stock load failed:",e.message);
+    if(badge) badge.textContent="⚠ Stock check unavailable (offline?)";
+  }
+  updateStockBadge();
+}
+
+/* Exact brand+name match first; falls back to a name-only match across
+   brands (useful since the two systems don't share a common item ID). */
+function findInventoryMatch(brand,name){
+  const exact=inventoryMap[normKey(brand,name)];
+  if(exact) return exact;
+  const nameU=String(name||"").trim().toUpperCase();
+  const foundKey=Object.keys(inventoryMap).find(k=>k.split("|")[1]===nameU);
+  return foundKey?inventoryMap[foundKey]:null;
+}
+
+function updateStockBadge(){
+  const badge=document.getElementById("stockBadge");
+  if(!badge) return;
+  if(!brandSel.value||!itemSel.value){ badge.textContent=""; return; }
+  if(!inventoryLoaded){ badge.textContent="Stock: checking…"; badge.style.color="#888"; return; }
+  const itemName=itemSel.options[itemSel.selectedIndex].text.trim();
+  const match=findInventoryMatch(brandSel.value,itemName);
+  const reqQty=+qty.value||0;
+  if(!match){ badge.textContent="Stock: not tracked in inventory"; badge.style.color="#888"; return; }
+  const short=reqQty>match.stock;
+  badge.textContent="Stock available: "+match.stock+" "+(match.unit||"")+(short?"  ⚠ short by "+(+(reqQty-match.stock).toFixed(2)):"  ✓ in stock");
+  badge.style.color=short?"#c62828":"#2e7d32";
+}
+
+/* Re-checks every row currently in the quotation table against live
+   inventory stock. Returns only the rows that are short — items not
+   found in the inventory catalog are left alone (not flagged), since
+   many quotation items are one-off / not stock-tracked. */
+function computeShortfalls(){
+  const shortfalls=[], untracked=[];
+  [...tbody.rows].forEach(r=>{
+    const cells=r.cells;
+    if(!cells||cells.length<7) return;
+    const brand=cells[1].innerText.trim();
+    const desc=cells[2].innerText.trim();
+    const unit=cells[5].innerText.trim();
+    const qtyReq=parseFloat(cells[6].innerText)||0;
+    if(!qtyReq) return;
+    const match=findInventoryMatch(brand,desc);
+    if(!match){
+      if(inventoryLoaded) untracked.push({brand,desc,unit,qtyReq});
+      return;
+    }
+    if(qtyReq>match.stock+1e-9){
+      shortfalls.push({brand,desc,unit,qtyReq,available:match.stock,shortQty:+(qtyReq-match.stock).toFixed(2)});
+    }
+  });
+  return {shortfalls,untracked};
+}
+
+let lastUntracked = [];
+
+/* Maps the Quotation tool's unit vocabulary onto the Inventory system's
+   unit vocabulary so newly-created items display correctly there. */
+const UNIT_TO_INVENTORY={"NOS":"NOS","MTRS":"Meters","COIL":"Coils","BOX":"Boxes","PKT":"PKT","DRUM":"DRUM","BUNDLE":"BUN"};
+function mapUnitToInventory(u){ return UNIT_TO_INVENTORY[String(u||"").trim().toUpperCase()] || (u||"NOS"); }
+
+/* Rough keyword-based category guess (matches the Inventory system's own
+   category list). Defaults to "Other" — easy to correct later from the
+   Inventory system's own Edit button. */
+function guessInventoryCategory(name){
+  const n=String(name||"").toUpperCase();
+  if(n.includes("WIRE")||n.includes("CABLE")||n.includes("SQMM")) return "Wires & Cables";
+  if(n.includes("SWITCH")||n.includes("SOCKET")||n.includes("PLATE")) return "Switches & Sockets";
+  if(n.includes("MCB")||n.includes("MCCB")||n.includes("DISTRIBUTION")||n.includes(" DB")) return "MCB & Distribution";
+  if(n.includes("LIGHT")||n.includes("LAMP")||n.includes("LED")||n.includes("BULB")||n.includes("FIXTURE")) return "Lights & Fixtures";
+  if(n.includes("PIPE")||n.includes("CONDUIT")||n.includes("BOX")||n.includes("CLIP")||n.includes("BEND")||n.includes("SADDLE")||n.includes("TAPE")) return "Conduits & Fittings";
+  if(n.includes("FAN")||n.includes("MOTOR")||n.includes("REGULATOR")) return "Fans & Motors";
+  return "Other";
+}
+
+/* Creates a new Inventory item (opening stock 0, GODOWN) for every quoted
+   item that had no inventory record at all, so it becomes tracked from
+   here on. Runs automatically after every save — never blocks the
+   quotation, and failures for individual items are only logged. */
+async function autoAddUntrackedToInventory(untracked){
+  const added=[];
+  for(const u of untracked){
+    try{
+      const unit=mapUnitToInventory(u.unit);
+      const payload={ name:u.desc, category:guessInventoryCategory(u.desc), unit, opening_stock:0, min_stock:0, brand:u.brand||"", location:"GODOWN" };
+      const { error } = await invSb.from("items").insert(payload);
+      if(error) throw error;
+      added.push(u);
+      inventoryMap[normKey(u.brand,u.desc)]={stock:0,unit,byLoc:{GODOWN:0}};
+    }catch(e){ console.warn("Auto-add to inventory failed for",u.desc,":",e.message); }
+  }
+  return added;
+}
+
+/* Rough unit guess from an item name, used only for the bulk catalog
+   push below (the master price list has no unit field of its own). */
+function guessUnitFromName(name){
+  const n=String(name||"").toUpperCase();
+  if(n.includes("MTR")) return "Meters";
+  if(n.includes("COIL")) return "Coils";
+  if(n.includes("PKT")) return "PKT";
+  if(n.includes("DRUM")) return "DRUM";
+  if(n.includes("BUNDLE")) return "BUN";
+  return "NOS";
+}
+
+/* "🏭 ADD ITEMS TO INVENTORY" button handler. One-time bulk push of
+   the ENTIRE master item/brand price list (the "items" catalog used
+   to populate the brand/item dropdowns everywhere in this tool) into
+   Inventory — irrespective of what's in any particular quotation.
+   Anything already present in Inventory (matched by brand+name) is
+   left untouched; only missing items get created, at opening stock 0. */
+async function addAllItemsToInventory(btn){
+  const status=document.getElementById("invStatus");
+  const original=btn ? btn.textContent : "";
+  if(btn){ btn.disabled=true; btn.textContent="⏳ Adding…"; }
+  try{
+    if(!inventoryLoaded) await loadInventoryStock();
+    const toAdd=[];
+    Object.keys(items).forEach(brand=>{
+      (items[brand]||[]).forEach(it=>{
+        const desc=it.name;
+        if(!desc) return;
+        if(findInventoryMatch(brand,desc)) return; // already tracked — skip
+        toAdd.push({brand, desc, unit: guessUnitFromName(desc)});
+      });
+    });
+    if(!toAdd.length){
+      const msg="Nothing to add — every item across all brands is already in Inventory.";
+      if(status) status.textContent=msg;
+      alert(msg);
+      return;
+    }
+    const added=await autoAddUntrackedToInventory(toAdd);
+    const failed=toAdd.length-added.length;
+    let msg=added.length+" item(s) added to Inventory ✓ (opening stock 0 — update the real counts there)";
+    if(failed) msg+=". "+failed+" failed — see browser console for details.";
+    if(status) status.textContent=added.length+" item(s) added to Inventory ✓";
+    alert(msg);
+  }catch(e){
+    console.error(e);
+    alert("Could not add items to Inventory: "+(e.message||e));
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent=original; }
+  }
+}
+
+function showIndentBanner(result,docNo,addedCount){
+  const banner=document.getElementById("indentBanner");
+  if(!banner) return;
+  const {shortfalls,untracked}=result;
+  if(!shortfalls.length && !untracked.length && !addedCount){ banner.style.display="none"; return; }
+  lastShortfalls=shortfalls;
+  lastUntracked=untracked;
+  lastIndentMeta={docNo:docNo||"", custName:(custName&&custName.value)||""};
+  const parts=[];
+  if(addedCount) parts.push(addedCount+" new item(s) added to Inventory (stock 0 — update the real count there)");
+  if(shortfalls.length) parts.push(shortfalls.length+" item(s) short in stock");
+  if(untracked.length) parts.push(untracked.length+" item(s) still not tracked");
+  document.getElementById("indentBannerText").textContent=
+    "⚠ "+parts.join(" · ")+" — quotation saved anyway. Generate an indent to raise a purchase request / verify stock.";
+  banner.style.display="flex";
+}
+function dismissIndentBanner(){ document.getElementById("indentBanner").style.display="none"; }
+
+/* Sequential indent numbers, e.g. SGE-SSE-IND-001, SGE-SSE-IND-002...
+   Counter is kept in this browser's localStorage since the indent itself
+   isn't saved to any database — it's just a print-and-send document. */
+function getNextIndentNo(){
+  const seq=(parseInt(localStorage.getItem("SSE_INDENT_SEQ")||"0",10)||0)+1;
+  localStorage.setItem("SSE_INDENT_SEQ",String(seq));
+  return "SGE-SSE-IND-"+String(seq).padStart(3,"0");
+}
+
+function generateIndentPDF(){
+  if(!lastShortfalls.length && !lastUntracked.length){ alert("No shortfall or untracked items to raise an indent for."); return; }
+  const now=new Date();
+  const indentNo=getNextIndentNo();
+  const rows=lastShortfalls.map((s,i)=>`
+    <tr>
+      <td style="padding:6px 8px;border:1px solid #ccc;text-align:center">${i+1}</td>
+      <td style="padding:6px 8px;border:1px solid #ccc">${s.brand||"-"}</td>
+      <td style="padding:6px 8px;border:1px solid #ccc">${s.desc}</td>
+      <td style="padding:6px 8px;border:1px solid #ccc;text-align:center">${s.unit||"-"}</td>
+      <td style="padding:6px 8px;border:1px solid #ccc;text-align:center;font-weight:700">${s.shortQty}</td>
+    </tr>`).join("");
+  const orderSection = lastShortfalls.length ? `
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="background:#f0f4fa">
+          <th style="padding:6px 8px;border:1px solid #ccc">#</th>
+          <th style="padding:6px 8px;border:1px solid #ccc">Brand</th>
+          <th style="padding:6px 8px;border:1px solid #ccc">Item Description</th>
+          <th style="padding:6px 8px;border:1px solid #ccc">Unit</th>
+          <th style="padding:6px 8px;border:1px solid #ccc">Qty</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>` : `<div style="font-size:12px;color:#777;font-style:italic">No confirmed shortfall items — nothing here to order.</div>`;
+  const untrackedRows=lastUntracked.map((s,i)=>`
+    <tr>
+      <td style="padding:6px 8px;border:1px solid #e0c060;text-align:center">${i+1}</td>
+      <td style="padding:6px 8px;border:1px solid #e0c060">${s.brand||"-"}</td>
+      <td style="padding:6px 8px;border:1px solid #e0c060">${s.desc}</td>
+      <td style="padding:6px 8px;border:1px solid #e0c060;text-align:center">${s.unit||"-"}</td>
+      <td style="padding:6px 8px;border:1px solid #e0c060;text-align:center">${s.qtyReq}</td>
+    </tr>`).join("");
+  const untrackedSection = lastUntracked.length ? `
+      <div style="margin-top:22px;padding:10px 12px;background:#fffbe6;border:1px dashed #e0c060;border-radius:6px">
+        <div style="font-size:12.5px;font-weight:700;color:#8a6d00;margin-bottom:6px">⚠ NOT TRACKED IN INVENTORY — verify stock manually before ordering (internal check, not confirmed shortage):</div>
+        <table style="width:100%;border-collapse:collapse;font-size:11.5px">
+          <thead><tr style="background:#fff3c4">
+            <th style="padding:5px 8px;border:1px solid #e0c060">#</th>
+            <th style="padding:5px 8px;border:1px solid #e0c060">Brand</th>
+            <th style="padding:5px 8px;border:1px solid #e0c060">Item Description</th>
+            <th style="padding:5px 8px;border:1px solid #e0c060">Unit</th>
+            <th style="padding:5px 8px;border:1px solid #e0c060">Qty Quoted</th>
+          </tr></thead>
+          <tbody>${untrackedRows}</tbody>
+        </table>
+        <div style="font-size:11px;color:#8a6d00;margin-top:6px">Tip: add these items to the Inventory system so future indents track them automatically.</div>
+      </div>` : "";
+  const html=`
+    <div style="font-family:Arial,sans-serif;color:#1a1a1a;padding:14px">
+      <div style="text-align:center;border-bottom:3px solid #185FA5;padding-bottom:10px;margin-bottom:14px">
+        <div style="font-size:19px;font-weight:800;letter-spacing:1px;color:#185FA5">SAI GANESH ELECTRICALS – SSE</div>
+        <div style="font-size:11px;color:#555">PLOT NO.19/P, SHOP NO.9, GROUND FLOOR, RAGHAVENDRA COLONY, SUCHITRA, HYDERABAD</div>
+        <div style="font-size:11px;color:#555">DASARI KRISHNA | PH: 9885750057 | krishnadsge@gmail.com</div>
+        <div style="font-size:15px;font-weight:700;margin-top:8px;text-transform:uppercase">Material Indent / Purchase Order</div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:12px">
+        <tr><td style="padding:3px 0"><b>Indent No:</b> ${indentNo}</td><td style="padding:3px 0"><b>Date:</b> ${now.toLocaleDateString("en-IN")}</td></tr>
+      </table>
+      ${orderSection}
+      ${untrackedSection}
+      <div style="margin-top:26px;font-size:12px"><b>Supplier:</b> _____________________________ &nbsp;&nbsp; <b>Expected Date:</b> ______________</div>
+      <div style="margin-top:8px;font-size:12px"><b>Remarks:</b> ___________________________________________________________</div>
+      <div style="display:flex;justify-content:space-between;margin-top:50px;font-size:12px">
+        <div>Prepared By: ______________</div>
+        <div>Approved By: ______________</div>
+      </div>
+    </div>`;
+  const holder=window.open("","_blank");
+  if(!holder){ alert("Please allow pop-ups for this site, then try again."); return; }
+  holder.document.write(`<!DOCTYPE html><html><head><title>Indent_${indentNo.replace(/[\/:]/g,"-")}</title>
+    <style>
+      @page{ margin:14mm; }
+      body{ font-family:Arial,sans-serif; color:#1a1a1a; margin:0; padding:0; }
+    </style>
+    </head><body>${html}
+    <script>
+      window.onload=function(){ setTimeout(function(){ window.print(); }, 200); };
+      window.onafterprint=function(){ window.close(); };
+    <\/script>
+    </body></html>`);
+  holder.document.close();
+}
+
 let currentPartyId = null;
 
 /* ===== MODE SWITCHING ===== */
@@ -968,6 +1271,14 @@ async function saveQuotation(){
     qno.value = docNo;
     status.textContent = `Saved as ${docNo} ✓`;
     setTimeout(()=>status.textContent="", 5000);
+    try{
+      /* No auto-create here anymore — saving a quotation only checks
+         stock so the indent banner can warn about shortages/untracked
+         items. Actually creating Inventory items now only happens
+         when the "ADD ITEMS TO INVENTORY" button is pressed. */
+      const final=computeShortfalls();
+      showIndentBanner(final, docNo, 0);
+    }catch(e){ console.warn("Stock check skipped:",e.message); }
   }catch(err){
     console.error(err);
     alert("Could not save: " + (err.message||err));
@@ -1332,6 +1643,7 @@ brandSel.onchange=()=>{
   if(hasCoilItem) unit.value="COIL";
   else if(hasPerMtrItem) unit.value="MTRS";
   updateQtyLabel();
+  updateStockBadge();
 };
 
 window.onload=()=>{
@@ -1343,6 +1655,7 @@ window.onload=()=>{
   updateTCDisplay();
   syncCmpPayUIVisibility();
   refreshPrices(false);
+  loadInventoryStock();
 };
 
 /* ===== PRICE EDITOR ===== */
@@ -1550,7 +1863,8 @@ function updateQtyLabel(){
   else qtyLabel.innerText="Qty";
 }
 
-itemSel.onchange=()=>{ mrp.value=itemSel.value; updateIndCopperBox(); updateQtyLabel(); };
+itemSel.onchange=()=>{ mrp.value=itemSel.value; updateIndCopperBox(); updateQtyLabel(); updateStockBadge(); };
+qty.addEventListener("input", updateStockBadge);
 document.getElementById("disc").addEventListener("input",()=>{ updateNetPerMtr(); });
 document.getElementById("net").addEventListener("input",()=>{ updateNetPerMtr(); });
 
